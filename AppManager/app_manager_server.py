@@ -1,5 +1,6 @@
 """ This service starts and stops application servers of a given application. """
 
+import argparse
 import fnmatch
 import glob
 import json
@@ -22,9 +23,11 @@ import appscale_info
 import constants
 import file_io
 import monit_app_configuration
-from monit_app_configuration import MONIT_CONFIG_DIR
 import monit_interface
 import misc
+from deployment_config import DeploymentConfig
+from deployment_config import ConfigInaccessible
+from monit_app_configuration import MONIT_CONFIG_DIR
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../AppServer'))
 from google.appengine.api.appcontroller_client import AppControllerClient
@@ -84,6 +87,10 @@ HTTP_OK = 200
 # The amount of seconds to wait before retrying to add routing.
 ROUTING_RETRY_INTERVAL = 5
 
+# A DeploymentConfig accessor.
+deployment_config = None
+
+
 class BadConfigurationException(Exception):
   """ An application is configured incorrectly. """
   def __init__(self, value):
@@ -140,6 +147,15 @@ def add_routing(app, port):
     app: A string that contains the application ID.
     port: A string that contains the port that the AppServer listens on.
   """
+  logging.info("Waiting for application {} on port {} to be active.".
+    format(str(app), str(port)))
+  if not wait_on_app(port):
+    # In case the AppServer fails we let the AppController to detect it
+    # and remove it if it still show in monit.
+    logging.warning("AppServer did not come up in time, for {}:{}.".
+      format(str(app), str(port)))
+    return
+
   acc = appscale_info.get_appcontroller_client()
   appserver_ip = appscale_info.get_private_ip()
 
@@ -200,6 +216,7 @@ def start_app(config):
   env_vars['GOPATH'] = '/root/appscale/AppServer/gopath/'
   env_vars['GOROOT'] = '/root/appscale/AppServer/goroot/'
   watch = "app___" + config['app_name']
+  match_cmd = ""
 
   if config['language'] == constants.PYTHON27 or \
       config['language'] == constants.GO or \
@@ -219,10 +236,22 @@ def start_app(config):
     copy_successful = copy_modified_jars(config['app_name'])
     if not copy_successful:
       return BAD_PID
+
+    # Account for MaxPermSize (~170MB), the parent process (~50MB), and thread
+    # stacks (~20MB).
+    max_heap = config['max_memory'] - 250
+    if max_heap <= 0:
+      return BAD_PID
     start_cmd = create_java_start_cmd(
       config['app_name'],
       config['app_port'],
-      config['load_balancer_ip'])
+      config['load_balancer_ip'],
+      max_heap
+    )
+    match_cmd = "java -ea -cp.*--port={}.*{}".format(str(config['app_port']),
+      os.path.dirname(locate_dir("/var/apps/" + config['app_name'] + "/app/",
+      "WEB-INF")))
+
     stop_cmd = create_java_stop_cmd(config['app_port'])
     env_vars.update(create_java_app_env(config['app_name']))
   else:
@@ -246,18 +275,20 @@ def start_app(config):
     env_vars,
     config['max_memory'],
     syslog_server,
-    appscale_info.get_private_ip())
+    appscale_info.get_private_ip(),
+    match_cmd=match_cmd)
 
-  if not monit_interface.start(watch):
-    logging.error("Unable to start application server with monit")
+  # We want to tell monit to start the single process instead of the
+  # group, since monit can get slow if there are quite a few processes in
+  # the same group.
+  full_watch = "{}-{}".format(str(watch), str(config['app_port']))
+  if not monit_interface.start(full_watch, is_group=False):
+    logging.warning("Monit was unable to start {}:{}".
+      format(str(config['app_name']), config['app_port']))
     return BAD_PID
 
-  if not wait_on_app(int(config['app_port'])):
-    logging.error("Application server did not come up in time, "
-      "removing monit watch")
-    monit_interface.stop(watch)
-    return BAD_PID
-
+  # Since we are going to wait, possibly for a long time for the
+  # application to be ready, we do it in a thread.
   threading.Thread(target=add_routing,
     args=(config['app_name'], config['app_port'])).start()
 
@@ -272,7 +303,6 @@ def start_app(config):
   if not setup_logrotate(config['app_name'], watch, log_size):
     logging.error("Error while setting up log rotation for application: {}".
       format(config['app_name']))
-
 
   return 0
 
@@ -364,7 +394,9 @@ def restart_app_instances_for_app(app_name, language):
     copy_modified_jars(app_name)
   logging.info("Restarting application %s" % app_name)
   watch = "app___" + app_name
-  return monit_interface.restart(watch)
+  monit_interface.stop(watch)
+  time.sleep(1)
+  return monit_interface.start(watch)
 
 def stop_app(app_name):
   """ Stops all process instances of a Google App Engine application on this
@@ -541,6 +573,15 @@ def create_java_app_env(app_name):
   custom_env_vars = extract_env_vars_from_xml(config_file)
   env_vars.update(custom_env_vars)
 
+  gcs_config = {'scheme': 'https', 'port': 443}
+  try:
+    gcs_config.update(deployment_config.get_config('gcs'))
+  except ConfigInaccessible:
+    logging.warning('Unable to fetch GCS configuration.')
+
+  if 'host' in gcs_config:
+    env_vars['GCS_HOST'] = '{scheme}://{host}:{port}'.format(**gcs_config)
+
   return env_vars
 
 def create_python27_start_cmd(app_name,
@@ -678,13 +719,14 @@ def copy_files_matching_pattern(file_path_pattern, dest):
   for file in glob.glob(file_path_pattern):
     shutil.copy(file, dest)
 
-def create_java_start_cmd(app_name, port, load_balancer_host):
+def create_java_start_cmd(app_name, port, load_balancer_host, max_heap):
   """ Creates the start command to run the java application server.
 
   Args:
     app_name: The name of the application to run
     port: The local port the application server will bind to
     load_balancer_host: The host of the load balancer
+    max_heap: An integer specifying the max heap size in MB.
   Returns:
     A string of the start command.
   """
@@ -698,6 +740,7 @@ def create_java_start_cmd(app_name, port, load_balancer_host):
     "--port=" + str(port),
     #this jvm flag allows javax.email to connect to the smtp server
     "--jvm_flag=-Dsocket.permit_connect=true",
+    '--jvm_flag=-Xmx{}m'.format(max_heap),
     "--disable_update_check",
     "--address=" + appscale_info.get_private_ip(),
     "--datastore_path=" + db_location,
@@ -706,7 +749,7 @@ def create_java_start_cmd(app_name, port, load_balancer_host):
     "--APP_NAME=" + app_name,
     "--NGINX_ADDRESS=" + load_balancer_host,
     "--NGINX_PORT=anything",
-    os.path.dirname(locate_dir("/var/apps/" + app_name +"/app/", "WEB-INF"))
+    os.path.dirname(locate_dir("/var/apps/" + app_name + "/app/", "WEB-INF"))
   ]
 
   return ' '.join(cmd)
@@ -759,18 +802,13 @@ def is_config_valid(config):
       return False
   return True
 
-def usage():
-  """ Prints usage of this program """
-  print "args: --help or -h for this menu"
 
 ################################
 # MAIN
 ################################
 if __name__ == "__main__":
-  for args_index in range(1, len(sys.argv)):
-    if sys.argv[args_index] in ("-h", "--help"):
-      usage()
-      sys.exit()
+  file_io.set_logging_format()
+  deployment_config = DeploymentConfig(appscale_info.get_zk_locations_string())
 
   INTERNAL_IP = appscale_info.get_private_ip()
   SERVER = SOAPpy.SOAPServer((INTERNAL_IP, constants.APP_MANAGER_PORT))
@@ -779,8 +817,6 @@ if __name__ == "__main__":
   SERVER.registerFunction(stop_app)
   SERVER.registerFunction(stop_app_instance)
   SERVER.registerFunction(restart_app_instances_for_app)
-
-  file_io.set_logging_format()
 
   while 1:
     try:

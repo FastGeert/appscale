@@ -46,12 +46,12 @@ case "$1" in
         installtornado
         installpycrypto 
         installflexmock
+        installpycapnp
         installzookeeper
         postinstallzookeeper
         installcassandra
         postinstallcassandra
         postinstallrabbitmq
-        installcelery
         installsolr
         installservice
         postinstallservice
@@ -67,7 +67,9 @@ case "$1" in
         installapiclient
         buildgo
         installtaskqueue
+        installdatastore
+        preplogserver
         prepdashboard
-        buildmapreduce
+        fetchclientjars
         ;;
 esac

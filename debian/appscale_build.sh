@@ -59,7 +59,7 @@ if grep docker /proc/1/cgroup > /dev/null ; then
     # Make sure we have default locale.
     locale-gen en_US en_US.UTF-8
     # Docker images miss the following.
-    mkdir /var/run/sshd
+    mkdir -p /var/run/sshd
     chmod 755 /var/run/sshd
 fi
 
@@ -95,8 +95,8 @@ case "$DIST" in
         "Wheezy due to the lack of official support for OpenJDK 8 in the "\
         "distro. Since a Java 8 runtime is needed for Cassandra, please "\
         "install one manually and change the JAVA path defined in "\
-        "AppDB/cassandra_env/templates/cassandra-env.sh before starting "\
-        "AppScale."
+        "AppDB/appscale/datastore/cassandra_env/templates/cassandra-env.sh "\
+        "before starting AppScale."
         read -p "Press [Enter] to continue build."
         ;;
 esac

@@ -13,14 +13,17 @@ import sys
 import time
 import tq_lib
 
+from cassandra import OperationTimedOut
+from cassandra.cluster import SimpleStatement
+from cassandra.policies import FallthroughRetryPolicy
+from distutils.spawn import find_executable
 from queue import InvalidLeaseRequest
 from queue import PullQueue
 from queue import PushQueue
 from task import Task
 from tq_config import TaskQueueConfig
-from unpackaged import APPSCALE_DATASTORE
-from unpackaged import APPSCALE_LIB_DIR
-from unpackaged import APPSCALE_PYTHON_APPSERVER
+from .unpackaged import APPSCALE_LIB_DIR
+from .unpackaged import APPSCALE_PYTHON_APPSERVER
 from .utils import logger
 
 sys.path.append(APPSCALE_LIB_DIR)
@@ -38,10 +41,10 @@ from google.appengine.api.taskqueue import taskqueue_service_pb
 from google.appengine.ext import db
 from google.appengine.runtime import apiproxy_errors
 
-sys.path.append(APPSCALE_DATASTORE)
-from cassandra_env.cassandra_interface import DatastoreProxy
-
 sys.path.append(TaskQueueConfig.CELERY_WORKER_DIR)
+
+# A policy that does not retry statements.
+NO_RETRIES = FallthroughRetryPolicy()
 
 
 def create_pull_queue_tables(cluster, session):
@@ -65,8 +68,15 @@ def create_pull_queue_tables(cluster, session):
       PRIMARY KEY ((app, queue, id))
     )
   """
-  cluster.refresh_schema_metadata()
-  session.execute(create_table)
+  statement = SimpleStatement(create_table, retry_policy=NO_RETRIES)
+  try:
+    session.execute(statement)
+  except OperationTimedOut:
+    logger.warning(
+      'Encountered an operation timeout while creating pull_queue_tasks. '
+      'Waiting 1 minute for schema to settle.')
+    time.sleep(60)
+    raise
 
   logger.info('Trying to create pull_queue_tasks_index')
   create_index_table = """
@@ -80,14 +90,20 @@ def create_pull_queue_tables(cluster, session):
       PRIMARY KEY ((app, queue, eta), id)
     )
   """
-  cluster.refresh_schema_metadata()
-  session.execute(create_index_table)
+  statement = SimpleStatement(create_index_table, retry_policy=NO_RETRIES)
+  try:
+    session.execute(statement)
+  except OperationTimedOut:
+    logger.warning(
+      'Encountered an operation timeout while creating pull_queue_tasks_index.'
+      ' Waiting 1 minute for schema to settle.')
+    time.sleep(60)
+    raise
 
   logger.info('Trying to create pull_queue_tags index')
   create_index = """
     CREATE INDEX IF NOT EXISTS pull_queue_tags ON pull_queue_tasks_index (tag);
   """
-  cluster.refresh_schema_metadata()
   session.execute(create_index)
 
   # This additional index is needed for groupByTag=true,tag=None queries
@@ -97,7 +113,6 @@ def create_pull_queue_tables(cluster, session):
     CREATE INDEX IF NOT EXISTS pull_queue_tag_exists
     ON pull_queue_tasks_index (tag_exists);
   """
-  cluster.refresh_schema_metadata()
   session.execute(create_index)
 
   logger.info('Trying to create pull_queue_leases')
@@ -109,8 +124,15 @@ def create_pull_queue_tables(cluster, session):
       PRIMARY KEY ((app, queue, leased))
     )
   """
-  cluster.refresh_schema_metadata()
-  session.execute(create_leases_table)
+  statement = SimpleStatement(create_leases_table, retry_policy=NO_RETRIES)
+  try:
+    session.execute(statement)
+  except OperationTimedOut:
+    logger.warning(
+      'Encountered an operation timeout while creating pull_queue_leases. '
+      'Waiting 1 minute for schema to settle.')
+    time.sleep(60)
+    raise
 
 
 class TaskName(db.Model):
@@ -188,8 +210,12 @@ class DistributedTaskQueue():
   # A dict that tells celery to run tasks even though we are running as root.
   CELERY_ENV_VARS = {"C_FORCE_ROOT" : True}
 
-  def __init__(self):
-    """ DistributedTaskQueue Constructor. """
+  def __init__(self, db_access):
+    """ DistributedTaskQueue Constructor.
+
+    Args:
+      db_access: A DatastoreProxy object.
+    """
     file_io.mkdir(self.LOG_DIR)
     file_io.mkdir(TaskQueueConfig.CELERY_WORKER_DIR)
     file_io.mkdir(TaskQueueConfig.CELERY_CONFIG_DIR)
@@ -206,7 +232,7 @@ class DistributedTaskQueue():
     apiproxy_stub_map.apiproxy.RegisterStub('datastore_v3', ds_distrib)
     os.environ['APPLICATION_ID'] = constants.DASHBOARD_APP_ID
 
-    self.db_access = DatastoreProxy()
+    self.db_access = db_access
 
     # Flag to see if code needs to be reloaded.
     self.__force_reload = False
@@ -395,7 +421,8 @@ class DistributedTaskQueue():
       return json.dumps({'error': True, 'reason': config_error.message})
    
     log_file = self.LOG_DIR + app_id + ".log"
-    command = ["/usr/local/bin/celery",
+    celery_bin = find_executable('celery')
+    command = [celery_bin,
                "worker",
                "--app=" + \
                     TaskQueueConfig.get_celery_worker_module_name(app_id),
@@ -436,17 +463,34 @@ class DistributedTaskQueue():
     Returns:
       A tuple of a encoded response, error code, and error detail.
     """
-    request = taskqueue_service_pb.\
-      TaskQueueFetchQueueStatsRequest(http_data)
-    response = taskqueue_service_pb.\
-      TaskQueueFetchQueueStatsResponse()
-    for queue in request.queue_name_list():
+    epoch = datetime.datetime.utcfromtimestamp(0)
+    request = taskqueue_service_pb.TaskQueueFetchQueueStatsRequest(http_data)
+    response = taskqueue_service_pb.TaskQueueFetchQueueStatsResponse()
+
+    for queue_name in request.queue_name_list():
+      queue = self.get_queue(app_id, queue_name)
       stats_response = response.add_queuestats()
-      count = TaskName.all().filter("state =", tq_lib.TASK_STATES.QUEUED).\
-        filter("queue =", queue).filter("app_id =", app_id).count()
-      stats_response.set_num_tasks(count)
-      stats_response.set_oldest_eta_usec(-1)
-    return (response.Encode(), 0, "")
+
+      if isinstance(queue, PullQueue):
+        num_tasks = queue.total_tasks()
+        oldest_eta = queue.oldest_eta()
+      else:
+        num_tasks = TaskName.all().\
+          filter("state =", tq_lib.TASK_STATES.QUEUED).\
+          filter("queue =", queue_name).\
+          filter("app_id =", app_id).count()
+
+        # This is not supported for push queues yet.
+        oldest_eta = None
+
+      # -1 is used to indicate an absence of a value.
+      oldest_eta_usec = (int((oldest_eta - epoch).total_seconds() * 1000000)
+                         if oldest_eta else -1)
+
+      stats_response.set_num_tasks(num_tasks)
+      stats_response.set_oldest_eta_usec(oldest_eta_usec)
+
+    return response.Encode(), 0, ""
 
   def purge_queue(self, app_id, http_data):
     """ 
@@ -590,8 +634,11 @@ class DistributedTaskQueue():
           task_info['id'] = add_request.task_name()
         if add_request.has_tag():
           task_info['tag'] = add_request.tag()
-        queue.add_task(Task(task_info))
+
+        new_task = Task(task_info)
+        queue.add_task(new_task)
         task_result.set_result(taskqueue_service_pb.TaskQueueServiceError.OK)
+        task_result.set_chosen_task_name(new_task.id)
         continue
 
       result = tq_lib.verify_task_queue_add_request(add_request.app_id(),
